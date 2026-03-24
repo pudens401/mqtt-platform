@@ -129,10 +129,22 @@ function resubscribeAll(session) {
 }
 
 function disconnectMqtt(session) {
-  if (session.client) {
+  const c = session.client
+  if (c) {
     try {
-      session.client.removeAllListeners()
-      session.client.end(true)
+      // IMPORTANT: never leave an EventEmitter without an 'error' listener.
+      // mqtt.js can emit errors (e.g., connack timeout) even while/after ending.
+      // Also: ensure late errors don't flip session state after user disconnects.
+      c.removeAllListeners('error')
+      c.on('error', () => {})
+
+      // Remove all listeners except 'error' to avoid leaks.
+      for (const eventName of c.eventNames()) {
+        if (eventName === 'error') continue
+        c.removeAllListeners(eventName)
+      }
+
+      c.end(true)
     } catch {
       // ignore
     }
@@ -147,7 +159,10 @@ function connectMqtt(session, { host, port, username, password, clientId }) {
   const portNum = Number(port)
   if (!Number.isFinite(portNum) || portNum <= 0 || portNum > 65535) throw new Error('Port must be a valid number')
 
-  const url = `mqtt://${host}:${portNum}`
+  // Support MQTT over TLS on the conventional port (8883).
+  // This is helpful on some hosted platforms where outbound 1883 may be filtered.
+  const scheme = portNum === 8883 ? 'mqtts' : 'mqtt'
+  const url = `${scheme}://${host}:${portNum}`
 
   disconnectMqtt(session)
   setStatus(session, 'connecting', '')
