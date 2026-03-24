@@ -1,0 +1,15 @@
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: white;
+  color: #0f172a;
+}
+
+/* Keep root flexible; Tailwind handles most styling */
+#root {
+  min-height: 100vh;
+}
