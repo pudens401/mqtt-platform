@@ -277,7 +277,9 @@ app.post('/api/publish', (req, res) => {
 
 // Serve the Vite build (single origin for / + /api + SSE)
 app.use(express.static(DIST_DIR))
-app.get('*', (req, res) => {
+// Express v5 (path-to-regexp v6) does not accept `*` as a path string.
+// Use a regex catch-all instead, and avoid intercepting API routes.
+app.get(/^(?!\/api).*/, (req, res) => {
   res.sendFile(path.join(DIST_DIR, 'index.html'))
 })
 

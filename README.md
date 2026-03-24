@@ -45,3 +45,28 @@ If it doesn’t load, allow inbound traffic in Windows Firewall for ports `5173`
 4. Go to **Dashboard** to interact live.
 
 All widget payloads are JSON-only.
+
+## Deploy on Render
+
+This repo can be deployed as a single Render **Web Service** (the Node bridge serves the built Vite frontend from `dist/`, and the UI calls `/api/*` on the same origin).
+
+### Option A (recommended): Blueprint via `render.yaml`
+
+1. Push this repo to GitHub.
+2. In Render: **New** → **Blueprint** → select the repo.
+3. Render will create a service named `mqtt-dash` using:
+	- Build: `npm install && npm run build`
+	- Start: `node server/index.js`
+
+### Option B: Manual Web Service
+
+1. In Render: **New** → **Web Service** → connect the repo.
+2. Environment: **Node**
+3. Build command: `npm install && npm run build`
+4. Start command: `node server/index.js`
+
+### Important: can Render reach your MQTT broker?
+
+The bridge connects to your broker over TCP (`mqtt://host:port`). If your broker is only on your home LAN (e.g. `192.168.x.x`), Render will **not** be able to reach it.
+
+To use Render, your broker must be reachable from the public internet (or via a private network/VPN you control). If you only need LAN access, run the bridge locally with `npm run dev:server`.
