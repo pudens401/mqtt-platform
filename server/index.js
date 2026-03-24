@@ -3,6 +3,8 @@ import cors from 'cors'
 import mqtt from 'mqtt'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import process from 'node:process'
+import { randomUUID } from 'node:crypto'
 
 const app = express()
 app.use(cors())
@@ -16,18 +18,72 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const DIST_DIR = path.resolve(__dirname, '..', 'dist')
 
-let client = null
-let status = 'disconnected' // disconnected | connecting | connected | error
-let errorMessage = ''
+const SESSION_COOKIE = 'mqtt_dash_sid'
+const SESSION_TTL_MS = 60 * 60 * 1000 // 1 hour
+const SESSIONS = new Map()
 
-const subRefCounts = new Map() // topic -> count
+function parseCookies(req) {
+  const header = req.headers?.cookie
+  if (!header) return {}
+  const out = {}
+  for (const part of header.split(';')) {
+    const [k, ...rest] = part.trim().split('=')
+    if (!k) continue
+    out[k] = decodeURIComponent(rest.join('=') || '')
+  }
+  return out
+}
 
-/** @type {Set<import('express').Response>} */
-const sseClients = new Set()
+function randomId() {
+  try {
+    return randomUUID()
+  } catch {
+    // ignore
+  }
+  return `sid_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
 
-function sseSend(event, data) {
+function isHttps(req) {
+  const xfProto = req.headers?.['x-forwarded-proto']
+  if (typeof xfProto === 'string') return xfProto.split(',')[0].trim() === 'https'
+  return !!req.secure
+}
+
+function setSessionCookie(res, sessionId, { secure } = {}) {
+  const parts = [`${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax']
+  if (secure) parts.push('Secure')
+  res.setHeader('Set-Cookie', parts.join('; '))
+}
+
+function getSession(req, res) {
+  const cookies = parseCookies(req)
+  let sid = cookies[SESSION_COOKIE]
+  if (!sid) {
+    sid = randomId()
+    setSessionCookie(res, sid, { secure: isHttps(req) })
+  }
+
+  let session = SESSIONS.get(sid)
+  if (!session) {
+    session = {
+      id: sid,
+      client: null,
+      status: 'disconnected',
+      errorMessage: '',
+      subRefCounts: new Map(),
+      sseClients: new Set(),
+      lastSeenAt: Date.now(),
+    }
+    SESSIONS.set(sid, session)
+  } else {
+    session.lastSeenAt = Date.now()
+  }
+  return session
+}
+
+function sseSend(session, event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-  for (const res of sseClients) {
+  for (const res of session.sseClients) {
     try {
       res.write(payload)
     } catch {
@@ -36,10 +92,10 @@ function sseSend(event, data) {
   }
 }
 
-function setStatus(nextStatus, nextErrorMessage = '') {
-  status = nextStatus
-  errorMessage = nextErrorMessage || ''
-  sseSend('status', { status, errorMessage })
+function setStatus(session, nextStatus, nextErrorMessage = '') {
+  session.status = nextStatus
+  session.errorMessage = nextErrorMessage || ''
+  sseSend(session, 'status', { status: session.status, errorMessage: session.errorMessage })
 }
 
 function safeToString(payload) {
@@ -53,39 +109,39 @@ function safeToString(payload) {
   }
 }
 
-function resubscribeAll() {
-  if (!client) return
-  const topics = Array.from(subRefCounts.entries())
+function resubscribeAll(session) {
+  if (!session.client) return
+  const topics = Array.from(session.subRefCounts.entries())
     .filter(([, count]) => count > 0)
     .map(([topic]) => topic)
 
   for (const topic of topics) {
     try {
-      client.subscribe(topic, (err) => {
-        if (err) sseSend('topicError', { topic, error: err.message || 'Subscription failed' })
-        else sseSend('topicOk', { topic })
+      session.client.subscribe(topic, (err) => {
+        if (err) sseSend(session, 'topicError', { topic, error: err.message || 'Subscription failed' })
+        else sseSend(session, 'topicOk', { topic })
       })
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Subscription failed'
-      sseSend('topicError', { topic, error: msg })
+      sseSend(session, 'topicError', { topic, error: msg })
     }
   }
 }
 
-function disconnectMqtt() {
-  if (client) {
+function disconnectMqtt(session) {
+  if (session.client) {
     try {
-      client.removeAllListeners()
-      client.end(true)
+      session.client.removeAllListeners()
+      session.client.end(true)
     } catch {
       // ignore
     }
   }
-  client = null
-  setStatus('disconnected', '')
+  session.client = null
+  setStatus(session, 'disconnected', '')
 }
 
-function connectMqtt({ host, port, username, password, clientId }) {
+function connectMqtt(session, { host, port, username, password, clientId }) {
   if (!host || typeof host !== 'string') throw new Error('Broker host is required')
 
   const portNum = Number(port)
@@ -93,10 +149,10 @@ function connectMqtt({ host, port, username, password, clientId }) {
 
   const url = `mqtt://${host}:${portNum}`
 
-  disconnectMqtt()
-  setStatus('connecting', '')
+  disconnectMqtt(session)
+  setStatus(session, 'connecting', '')
 
-  client = mqtt.connect(url, {
+  session.client = mqtt.connect(url, {
     clientId: clientId || undefined,
     username: username || undefined,
     password: password || undefined,
@@ -105,28 +161,28 @@ function connectMqtt({ host, port, username, password, clientId }) {
     clean: true,
   })
 
-  client.on('connect', () => {
-    setStatus('connected', '')
-    resubscribeAll()
+  session.client.on('connect', () => {
+    setStatus(session, 'connected', '')
+    resubscribeAll(session)
   })
 
-  client.on('reconnect', () => {
-    if (status !== 'connected') setStatus('connecting', '')
+  session.client.on('reconnect', () => {
+    if (session.status !== 'connected') setStatus(session, 'connecting', '')
   })
 
-  client.on('close', () => {
-    if (status !== 'error') setStatus('disconnected', '')
+  session.client.on('close', () => {
+    if (session.status !== 'error') setStatus(session, 'disconnected', '')
   })
 
-  client.on('offline', () => {
-    if (status !== 'error') setStatus('disconnected', '')
+  session.client.on('offline', () => {
+    if (session.status !== 'error') setStatus(session, 'disconnected', '')
   })
 
-  client.on('error', (err) => {
-    setStatus('error', err?.message || 'MQTT error')
+  session.client.on('error', (err) => {
+    setStatus(session, 'error', err?.message || 'MQTT error')
   })
 
-  client.on('message', (topic, payload) => {
+  session.client.on('message', (topic, payload) => {
     const rawText = safeToString(payload)
     let payloadObj = null
     let payloadError = ''
@@ -136,7 +192,7 @@ function connectMqtt({ host, port, username, password, clientId }) {
       payloadError = err instanceof Error ? err.message : 'Invalid JSON payload'
     }
 
-    sseSend('message', {
+    sseSend(session, 'message', {
       topic,
       rawText,
       payloadObj,
@@ -149,19 +205,21 @@ function connectMqtt({ host, port, username, password, clientId }) {
 }
 
 app.get('/api/status', (req, res) => {
-  res.json({ status, errorMessage })
+  const session = getSession(req, res)
+  res.json({ status: session.status, errorMessage: session.errorMessage })
 })
 
 app.get('/api/events', (req, res) => {
+  const session = getSession(req, res)
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders?.()
 
-  sseClients.add(res)
+  session.sseClients.add(res)
 
   // initial status
-  res.write(`event: status\ndata: ${JSON.stringify({ status, errorMessage })}\n\n`)
+  res.write(`event: status\ndata: ${JSON.stringify({ status: session.status, errorMessage: session.errorMessage })}\n\n`)
 
   const pingId = setInterval(() => {
     try {
@@ -173,48 +231,52 @@ app.get('/api/events', (req, res) => {
 
   req.on('close', () => {
     clearInterval(pingId)
-    sseClients.delete(res)
+    session.sseClients.delete(res)
+    session.lastSeenAt = Date.now()
   })
 })
 
 app.post('/api/connect', (req, res) => {
+  const session = getSession(req, res)
   try {
-    const result = connectMqtt(req.body || {})
+    const result = connectMqtt(session, req.body || {})
     res.json({ ok: true, ...result })
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Failed to connect'
-    setStatus('error', msg)
+    setStatus(session, 'error', msg)
     res.status(400).json({ ok: false, error: msg })
   }
 })
 
 app.post('/api/disconnect', (req, res) => {
-  disconnectMqtt()
+  const session = getSession(req, res)
+  disconnectMqtt(session)
   res.json({ ok: true })
 })
 
 app.post('/api/subscribe', (req, res) => {
+  const session = getSession(req, res)
   const { topic } = req.body || {}
   if (!topic || typeof topic !== 'string') {
     res.status(400).json({ ok: false, error: 'Topic is required' })
     return
   }
 
-  const prev = subRefCounts.get(topic) || 0
-  subRefCounts.set(topic, prev + 1)
+  const prev = session.subRefCounts.get(topic) || 0
+  session.subRefCounts.set(topic, prev + 1)
 
-  if (client && prev === 0) {
+  if (session.client && prev === 0) {
     try {
-      client.subscribe(topic, (err) => {
+      session.client.subscribe(topic, (err) => {
         if (err) {
-          sseSend('topicError', { topic, error: err.message || 'Subscription failed' })
+          sseSend(session, 'topicError', { topic, error: err.message || 'Subscription failed' })
         } else {
-          sseSend('topicOk', { topic })
+          sseSend(session, 'topicOk', { topic })
         }
       })
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Subscription failed'
-      sseSend('topicError', { topic, error: msg })
+      sseSend(session, 'topicError', { topic, error: msg })
     }
   }
 
@@ -222,21 +284,22 @@ app.post('/api/subscribe', (req, res) => {
 })
 
 app.post('/api/unsubscribe', (req, res) => {
+  const session = getSession(req, res)
   const { topic } = req.body || {}
   if (!topic || typeof topic !== 'string') {
     res.status(400).json({ ok: false, error: 'Topic is required' })
     return
   }
 
-  const prev = subRefCounts.get(topic) || 0
+  const prev = session.subRefCounts.get(topic) || 0
   const next = Math.max(0, prev - 1)
 
-  if (next === 0) subRefCounts.delete(topic)
-  else subRefCounts.set(topic, next)
+  if (next === 0) session.subRefCounts.delete(topic)
+  else session.subRefCounts.set(topic, next)
 
-  if (client && prev === 1) {
+  if (session.client && prev === 1) {
     try {
-      client.unsubscribe(topic)
+      session.client.unsubscribe(topic)
     } catch {
       // ignore
     }
@@ -246,6 +309,7 @@ app.post('/api/unsubscribe', (req, res) => {
 })
 
 app.post('/api/publish', (req, res) => {
+  const session = getSession(req, res)
   const { topic, payload } = req.body || {}
 
   if (!topic || typeof topic !== 'string') {
@@ -253,7 +317,7 @@ app.post('/api/publish', (req, res) => {
     return
   }
 
-  if (!client) {
+  if (!session.client) {
     res.status(400).json({ ok: false, error: 'Not connected' })
     return
   }
@@ -266,7 +330,7 @@ app.post('/api/publish', (req, res) => {
     return
   }
 
-  client.publish(topic, message, {}, (err) => {
+  session.client.publish(topic, message, {}, (err) => {
     if (err) {
       res.status(500).json({ ok: false, error: err.message || 'Publish failed' })
     } else {
@@ -274,6 +338,26 @@ app.post('/api/publish', (req, res) => {
     }
   })
 })
+
+// Cleanup stale sessions to avoid leaking MQTT connections.
+setInterval(() => {
+  const now = Date.now()
+  for (const [sid, session] of SESSIONS.entries()) {
+    const isStale = now - (session.lastSeenAt || 0) > SESSION_TTL_MS
+    const hasListeners = session.sseClients && session.sseClients.size > 0
+    if (isStale || (!hasListeners && session.status !== 'disconnected')) {
+      try {
+        disconnectMqtt(session)
+      } catch {
+        // ignore
+      }
+    }
+
+    if (isStale && (!session.client || session.status === 'disconnected') && !hasListeners) {
+      SESSIONS.delete(sid)
+    }
+  }
+}, 60_000).unref?.()
 
 // Serve the Vite build (single origin for / + /api + SSE)
 app.use(express.static(DIST_DIR))

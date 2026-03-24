@@ -70,3 +70,13 @@ This repo can be deployed as a single Render **Web Service** (the Node bridge se
 The bridge connects to your broker over TCP (`mqtt://host:port`). If your broker is only on your home LAN (e.g. `192.168.x.x`), Render will **not** be able to reach it.
 
 To use Render, your broker must be reachable from the public internet (or via a private network/VPN you control). If you only need LAN access, run the bridge locally with `npm run dev:server`.
+
+### Multi-user behavior
+
+This bridge is now **session-isolated**:
+
+- **One browser session → one MQTT connection** (each user can choose a different broker + MQTT client ID without affecting others).
+- The session is tracked via an HttpOnly cookie (`mqtt_dash_sid`).
+- Sessions are stored **in-memory** in the Node process with a TTL cleanup.
+
+If you run multiple instances (horizontal scaling), users may land on different instances unless you add sticky sessions or an external session store.

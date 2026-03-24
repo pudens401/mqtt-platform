@@ -205,6 +205,39 @@ export function MqttProvider({ children }) {
     }
   }, [disconnect])
 
+  useEffect(() => {
+    // Best-effort disconnect when the tab/window closes or navigates away.
+    // This helps release the per-session MQTT connection sooner.
+    function sendDisconnect() {
+      try {
+        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          navigator.sendBeacon('/api/disconnect')
+          return
+        }
+      } catch {
+        // ignore
+      }
+
+      try {
+        fetch('/api/disconnect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+          keepalive: true,
+        }).catch(() => {})
+      } catch {
+        // ignore
+      }
+    }
+
+    const onPageHide = () => sendDisconnect()
+    window.addEventListener('pagehide', onPageHide)
+
+    return () => {
+      window.removeEventListener('pagehide', onPageHide)
+    }
+  }, [])
+
   const value = useMemo(
     () => ({
       status,
