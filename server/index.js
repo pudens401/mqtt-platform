@@ -345,7 +345,7 @@ app.post('/api/publish', (req, res) => {
     return
   }
 
-  session.client.publish(topic, message, {}, (err) => {
+  session.client.publish(topic, message, { retain: true }, (err) => {
     if (err) {
       res.status(500).json({ ok: false, error: err.message || 'Publish failed' })
     } else {
